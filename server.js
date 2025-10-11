@@ -127,6 +127,17 @@ io.on('connection', (socket) => {
         // Store connection mapping
         activeConnections.set(socket.id, user._id);
         
+        // Send user info back to the client including role and _id
+        socket.emit('userConfirmed', {
+          _id: user._id,
+          username: user.username,
+          walletAddress: user.walletAddress,
+          publicKey: user.walletAddress, // Also include as publicKey for compatibility
+          avatar: user.avatar,
+          role: user.role,
+          isOnline: true
+        });
+        
         // Broadcast user joined
         socket.broadcast.emit('userJoined', {
           username: user.username,
@@ -201,6 +212,8 @@ io.on('connection', (socket) => {
       io.emit('newMessage', {
         id: message._id,
         username: message.username,
+        walletAddress: user.walletAddress,
+        role: user.role || 'user',
         text: message.text,
         timestamp: message.timestamp,
         avatar: message.avatar,
@@ -231,8 +244,12 @@ io.on('connection', (socket) => {
 
       const broadcastMessages = [];
       
+      // Get all active channels dynamically from database
+      const allChannels = await Channel.find({ isActive: true }).select('name');
+      const channelNames = allChannels.map(ch => ch.name);
+      
       // Create a message for each channel
-      for (const channelName of channels) {
+      for (const channelName of channelNames) {
         const message = new Message({
           username: user.username,
           text: messageData.text,
@@ -256,6 +273,8 @@ io.on('connection', (socket) => {
         broadcastMessages.push({
           id: message._id,
           username: message.username,
+          walletAddress: user.walletAddress,
+          role: user.role || 'user',
           text: message.text,
           timestamp: message.timestamp,
           avatar: message.avatar,
@@ -322,6 +341,10 @@ app.get('/api/health', async (req, res) => {
     const totalUsers = await User.countDocuments();
     const totalMessages = await Message.countDocuments();
     
+    // Get all active channels dynamically from database
+    const allChannels = await Channel.find({ isActive: true }).select('name');
+    const channelNames = allChannels.map(ch => ch.name);
+    
     res.json({ 
       status: 'OK', 
       connectedUsers: activeConnections.size,
@@ -329,7 +352,7 @@ app.get('/api/health', async (req, res) => {
       totalUsers: totalUsers,
       totalMessages: totalMessages,
       totalConnections: io.engine.clientsCount,
-      channels: channels,
+      channels: channelNames,
       timestamp: new Date().toISOString()
     });
   } catch (error) {
@@ -347,9 +370,23 @@ app.get('/api/messages', async (req, res) => {
       .sort({ timestamp: -1 })
       .limit(limit)
       .skip(skip)
-      .select('username text timestamp avatar channel isBroadcast');
+      .populate('userId', 'walletAddress role')
+      .select('username text timestamp avatar channel isBroadcast userId');
     
-    res.json(messages.reverse()); // Reverse to show oldest first
+    // Transform messages to include wallet address and role
+    const transformedMessages = messages.map(msg => ({
+      id: msg._id,
+      username: msg.username,
+      walletAddress: msg.userId?.walletAddress || msg.username,
+      role: msg.userId?.role || 'user',
+      text: msg.text,
+      timestamp: msg.timestamp,
+      avatar: msg.avatar,
+      channel: msg.channel,
+      isBroadcast: msg.isBroadcast
+    }));
+    
+    res.json(transformedMessages.reverse()); // Reverse to show oldest first
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch messages' });
   }
@@ -360,13 +397,31 @@ app.get('/api/messages/all', async (req, res) => {
     const limit = parseInt(req.query.limit) || 50;
     const allMessages = {};
     
-    for (const channel of channels) {
-      const messages = await Message.find({ channel })
+    // Get all active channels dynamically from database
+    const allChannels = await Channel.find({ isActive: true }).select('name');
+    const channelNames = allChannels.map(ch => ch.name);
+    
+    for (const channelName of channelNames) {
+      const messages = await Message.find({ channel: channelName })
         .sort({ timestamp: -1 })
         .limit(limit)
-        .select('username text timestamp avatar channel isBroadcast');
+        .populate('userId', 'walletAddress role')
+        .select('username text timestamp avatar channel isBroadcast userId');
       
-      allMessages[channel] = messages.reverse();
+      // Transform messages to include wallet address and role
+      const transformedMessages = messages.map(msg => ({
+        id: msg._id,
+        username: msg.username,
+        walletAddress: msg.userId?.walletAddress || msg.username,
+        role: msg.userId?.role || 'user',
+        text: msg.text,
+        timestamp: msg.timestamp,
+        avatar: msg.avatar,
+        channel: msg.channel,
+        isBroadcast: msg.isBroadcast
+      }));
+      
+      allMessages[channelName] = transformedMessages.reverse();
     }
     
     res.json(allMessages);
@@ -418,7 +473,7 @@ app.get('/api/voice-channels', async (req, res) => {
 // Create new text channel
 app.post('/api/channels', async (req, res) => {
   try {
-    const { name, description } = req.body;
+    const { name, description, userId, username, walletAddress } = req.body;
 
     if (!name) {
       return res.status(400).json({ error: 'Channel name is required' });
@@ -430,21 +485,53 @@ app.post('/api/channels', async (req, res) => {
       return res.status(400).json({ error: 'Channel already exists' });
     }
 
-    // Find or create system user for admin-created channels
-    let systemUser = await User.findOne({ username: 'system' });
-    if (!systemUser) {
-      systemUser = new User({
-        username: 'system',
-        walletAddress: '0x0000000000000000000000000000000000000000',
-        isOnline: false
+    let creatorUserId;
+
+    // If userId is provided, use it directly
+    if (userId) {
+      const user = await User.findById(userId);
+      if (user) {
+        creatorUserId = user._id;
+      }
+    } 
+    // If username or walletAddress is provided, find the user
+    else if (username || walletAddress) {
+      let user = await User.findOne({ 
+        $or: [
+          ...(username ? [{ username }] : []),
+          ...(walletAddress ? [{ walletAddress }] : [])
+        ]
       });
-      await systemUser.save();
+
+      if (!user) {
+        // Create new user if they don't exist
+        user = new User({
+          username: username || `user_${Date.now()}`,
+          walletAddress: walletAddress || null,
+          isOnline: false
+        });
+        await user.save();
+      }
+      creatorUserId = user._id;
+    } 
+    // Fallback to system user if no user info provided
+    else {
+      let systemUser = await User.findOne({ username: 'system' });
+      if (!systemUser) {
+        systemUser = new User({
+          username: 'system',
+          walletAddress: '0x0000000000000000000000000000000000000000',
+          isOnline: false
+        });
+        await systemUser.save();
+      }
+      creatorUserId = systemUser._id;
     }
 
     const channel = new Channel({
       name: name.toLowerCase(),
       description: description || `Channel for ${name}`,
-      createdBy: systemUser._id
+      createdBy: creatorUserId
     });
 
     await channel.save();
@@ -452,6 +539,9 @@ app.post('/api/channels', async (req, res) => {
     // Populate the created channel
     const populatedChannel = await Channel.findById(channel._id)
       .populate('createdBy', 'username');
+
+    // Emit socket event to notify all clients of new channel
+    io.emit('channelCreated', populatedChannel);
 
     res.status(201).json(populatedChannel);
   } catch (error) {
@@ -610,11 +700,37 @@ app.delete('/api/channels/:id/messages', async (req, res) => {
 app.delete('/api/channels/:id', async (req, res) => {
   try {
     const channelId = req.params.id;
+    const { userId } = req.body;
     
     // Find the channel to get its name
-    const channel = await Channel.findById(channelId);
+    const channel = await Channel.findById(channelId).populate('createdBy');
     if (!channel) {
       return res.status(404).json({ error: 'Channel not found' });
+    }
+    
+    // Check if user is authorized to delete the channel
+    if (userId) {
+      // Get the user
+      const user = await User.findById(userId);
+      if (!user) {
+        return res.status(403).json({ error: 'User not found' });
+      }
+      
+      // Check if user is the channel owner or has admin role
+      const isOwner = channel.createdBy._id.toString() === userId || 
+                      channel.createdBy.username === user.username ||
+                      channel.createdBy.walletAddress === user.walletAddress;
+      const isAdmin = user.role === 'admin' || user.role === 'moderator';
+      
+      if (!isOwner && !isAdmin) {
+        return res.status(403).json({ error: 'You do not have permission to delete this channel' });
+      }
+    } else {
+      // If no userId provided, only allow deletion by system user
+      const systemUser = await User.findOne({ username: 'system' });
+      if (!systemUser || channel.createdBy._id.toString() !== systemUser._id.toString()) {
+        return res.status(403).json({ error: 'Authentication required to delete this channel' });
+      }
     }
     
     // Delete all messages in this channel first
@@ -622,6 +738,9 @@ app.delete('/api/channels/:id', async (req, res) => {
     
     // Delete the channel
     await Channel.findByIdAndDelete(channelId);
+    
+    // Emit socket event to notify all clients
+    io.emit('channelDeleted', channelId);
     
     res.json({ 
       success: true, 

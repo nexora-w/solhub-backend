@@ -15,7 +15,6 @@ const messageSchema = new mongoose.Schema({
   channel: {
     type: String,
     required: true,
-    enum: ['general', 'trading', 'nft', 'defi', 'announcements'],
     default: 'general'
   },
   avatar: {
