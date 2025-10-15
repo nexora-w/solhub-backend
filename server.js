@@ -706,6 +706,37 @@ app.delete('/api/channels/:id/messages', async (req, res) => {
 });
 
 // Delete a text channel
+app.delete('/api/admin/channels/:id', async (req, res) => {
+  try {
+    const channelId = req.params.id;
+    
+    // Find the channel to get its name
+    const channel = await Channel.findById(channelId).populate('createdBy');
+    if (!channel) {
+      return res.status(404).json({ error: 'Channel not found' });
+    }
+    
+    // Delete all messages in this channel first
+    const messageResult = await Message.deleteMany({ channel: channel.name });
+    
+    // Delete the channel
+    await Channel.findByIdAndDelete(channelId);
+    
+    // Emit socket event to notify all clients
+    io.emit('channelDeleted', channelId);
+    
+    res.json({ 
+      success: true, 
+      message: `Successfully deleted channel "${channel.name}" and ${messageResult.deletedCount} messages`,
+      deletedMessages: messageResult.deletedCount
+    });
+  } catch (error) {
+    console.error('Error deleting channel:', error);
+    res.status(500).json({ error: 'Failed to delete channel' });
+  }
+});
+
+// Delete a text channel
 app.delete('/api/channels/:id', async (req, res) => {
   try {
     const channelId = req.params.id;
