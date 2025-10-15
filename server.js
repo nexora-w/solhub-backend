@@ -295,13 +295,22 @@ io.on('connection', (socket) => {
   });
 
   // Handle typing indicators
-  socket.on('typing', (data) => {
+  socket.on('typing', async (data) => {
     const userId = activeConnections.get(socket.id);
     if (userId) {
-      socket.broadcast.emit('userTyping', {
-        userId: userId,
-        isTyping: data.isTyping
-      });
+      try {
+        const user = await User.findById(userId);
+        if (user) {
+          socket.broadcast.emit('userTyping', {
+            userId: userId,
+            username: user.username,
+            isTyping: data.isTyping,
+            channel: data.channel
+          });
+        }
+      } catch (error) {
+        console.error('Error handling typing indicator:', error);
+      }
     }
   });
 
